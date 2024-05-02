@@ -1,0 +1,9 @@
+//org.eclipse.ui.commands/state/org.eclipse.ui.navigator.resources.nested.changeProjectPresentation/org.eclipse.ui.commands.radioState=false
+ColorsAndFontsPreferencePage.expandedCategories=Torg.eclipse.cdt.ui.presentation\tTorg.eclipse.cdt.ui.CEditor.presentation
+ColorsAndFontsPreferencePage.selectedElement=Forg.eclipse.cdt.ui.editors.textfont
+UIActivities.org.eclipse.cdt.debug.cdigdbActivity=true
+UIActivities.org.eclipse.cdt.debug.dsfgdbActivity=true
+eclipse.preferences.version=1
+org.eclipse.cdt.internal.ui.compare.AsmMergeViewer=1|Monospace|14.0|0|GTK|1|;
+org.eclipse.cdt.internal.ui.compare.CMergeViewer=1|Monospace|14.0|0|GTK|1|;
+org.eclipse.cdt.ui.editors.textfont=1|Monospace|14.0|0|GTK|1|;

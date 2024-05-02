@@ -1,0 +1,964 @@
+#include "pdafv_pipeline.h"
+#include "pca.h"
+#include <cstdio>
+#include "Fisher_encoding.h"
+#include <vl/dsift.h>
+#include <vector>
+#include "common.h"
+#include <sys/stat.h>
+#include <vl/svm.h>
+#include "random_sampling.h"
+#include <ctime>
+#include <ctime>
+#include "gmm.h"
+#include "pbsif.h"
+
+#ifdef WIN32
+	#include <direct.h>
+	#include <process.h>	
+#else
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+using namespace std;
+using namespace cv;
+using namespace visual_features;
+using namespace clustering_and_indexing;
+using namespace dimension_reduction;
+
+#define max_iter 100
+#define epsilon 0.001
+#define svm_C 10
+#define nr_classes 2
+#define sample_prefix "/sample_descriptors"
+#define descriptors_folder "/descriptors_folder"
+#define fv_folder "/fv_folder_"
+#define fv_descriptors_prefix "/fv_descriptors"
+#define pca_descriptors_prefix "/pca_descriptors"
+#define ext ".bin"
+#define suffix "_info.bin"
+#define svm_model_name "svm_model"
+#define classifier_path "haarcascade_frontalface_alt.xml"
+#define MAX_FSIZE 8388608000
+#define MAX_WIDTH 1000
+#define MAX_HEIGTH 1000
+
+/*--------------------------------------------------------------------------------------------------*/
+
+namespace pdafv
+{
+	void training_fv_encoder(extract_params<float> params)
+	{
+		/*-------------------------------obtain sample image descriptors-------------------------------*/
+		vector<string> source_url;
+
+		if(params.folder_path)
+		{
+			if (params.source_type == Image)
+			{
+				vector<string> img_bmp, img_png, img_jpg;
+				get_files(params.sourceDir, ".tiff", source_url);
+				get_files(params.sourceDir, ".bmp", img_bmp);
+				get_files(params.sourceDir, ".jpg", img_jpg);
+				get_files(params.sourceDir, ".png", img_png);
+				
+				source_url.insert(source_url.end(), img_bmp.begin(), img_bmp.end());
+				source_url.insert(source_url.end(), img_jpg.begin(), img_jpg.end());
+				source_url.insert(source_url.end(), img_png.begin(), img_png.end());
+			}
+			else
+			{
+				vector<string> img_mp4;
+				vector<string> img_mov;
+				get_files(params.sourceDir, ".avi", source_url);
+				get_files(params.sourceDir, ".mp4", img_mp4);
+				get_files(params.sourceDir, ".mov", img_mov);
+				source_url.insert(source_url.end(), img_mp4.begin(), img_mp4.end());
+				source_url.insert(source_url.end(), img_mov.begin(), img_mov.end());
+			}
+		}
+		else
+			LoadTextFile(params.sourceDir, source_url);
+
+		BLONG descriptor_size = 0; 	
+		int db_size = source_url.size();	
+		float* samples_descriptors = NULL;
+
+		int filter_dim[3];
+		float* filter_data = NULL;
+		//Reading filters
+		//printf("Reading filter\n");
+		read_filter(filter_dim, &filter_data, params.filter_path);
+
+
+		int channels = 1;
+		char idx[3] = { 0, 1, 2 };
+
+		if (!params.gray)
+		{
+			switch (params.channels_params)
+			{
+			case all:
+				channels = 3;
+				break;
+			case green:
+				idx[0] = 1;
+				break;
+			case blue:
+				idx[0] = 2;
+				break;
+			case red:
+				break;
+			}
+		}
+		//timeb ini, end;
+
+		////////////////////////////////////////////////////////////////////
+		///		DSIFT EXTRACTION AND SAVING FOR EACH IMAGE				///
+		///////////////////////////////////////////////////////////////////
+		CascadeClassifier face_classifier = LoadFaceClassifier(classifier_path);
+
+	#ifdef WIN32
+		mkdir((string(params.outputDir) + descriptors_folder).c_str());
+	#else
+		mkdir((string(params.outputDir) + descriptors_folder).c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+	#endif
+	
+		if(LoadDescrBinaryInfo(string(params.outputDir) + descriptors_folder + sample_prefix + suffix, &descriptor_size) > 0)
+		{		
+			printf("Loading extracted features...\n");
+			samples_descriptors = (float*)malloc(sizeof(float)*descriptor_size);		
+			LoadDescrBinary(string(params.outputDir) + descriptors_folder + sample_prefix + ext, samples_descriptors, descriptor_size);	
+		}
+		else
+		{
+			printf("Extracting and saving features...\n");		
+			//descriptor_size = 0;
+			srand(getpid() + time(NULL));
+			random_shuffle(source_url.begin(), source_url.end());
+			//GetLabels(imgs_url, "/live/");
+			samples_descriptors = (float*)malloc(sizeof(float)*params.descriptors_count*params.features_dim);
+
+			int numDescrsPerImage = params.descriptors_count / (db_size * channels);
+
+			printf("Number of descriptors for sample: %i\n", numDescrsPerImage);
+
+			descriptor_size = params.descriptors_count*params.features_dim;
+	#pragma omp parallel for
+			for (int i = 0; i < db_size; i++)
+			{				
+				printf("feature extraction for source %i of %i\n", i, db_size);
+				//printf("Name %s\n", source_url[i].c_str());
+
+				if(params.source_type == Image)
+				{
+					Mat img_i = readImage(source_url[i], params.gray);
+					if (img_i.empty()) {
+						cout << "ERROR" << endl;
+						continue;
+					}
+
+					Mat face = img_i;
+					if (params.face_detector)
+						face = FaceDetection(img_i, face_classifier, params.gray);
+
+					if(params.hsv)
+						cvtColor(face,face, COLOR_BGR2HSV);
+                    else if(params.ycc)
+                        cvtColor(face,face, COLOR_BGR2YCrCb);
+
+					Mat bgr[3];
+
+					if (!params.gray)
+						split(face, bgr);//split source 
+					else
+						bgr[0] = face;
+
+
+					int point_idx = source_url[i].rfind('.');
+
+					string point_file = source_url[i].substr(0, point_idx - 1);
+					point_file += ".txt";
+
+					vector<tuple<int, int>> landmarks;
+
+					if(is_file_exist(point_file.c_str()) && params.points)
+						landmarks = load_points(point_file.c_str());
+
+
+					for (int k_i = 0; k_i < channels; k_i++)
+					{
+						vector<float> desc = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+						//ftime(&end);
+
+						//printf("Time %d\n", (end.time - ini.time) * 1000 + (end.millitm - ini.millitm));
+
+						int keypoint_size = desc.size() / params.features_dim;
+						//printf("Keypoint %i\n", keypoint_size);
+						//SELECTING RANDOM VECTORS FROM EACH IMAGE FOR MODEL TRAINING
+						int* index = (int*)malloc(sizeof(int)*keypoint_size);
+						for (int j = 0; j < keypoint_size; j++)
+							index[j] = j;
+						shuffle(index, keypoint_size);
+						for (int j = 0; j < numDescrsPerImage; j++)
+						{
+							for (int k = 0; k < params.features_dim; k++)
+								samples_descriptors[(i + k_i)*numDescrsPerImage*params.features_dim + j * params.features_dim + k] = desc[index[j] * params.features_dim + k];
+						}
+						free(index);
+					}
+				}
+				else
+				{
+					VideoCapture cap(source_url[i]);
+
+					if (!cap.isOpened()) {
+						cout << "Error opening video stream or file" << endl;
+					}
+                    
+                    int video_len = cap.get(CV_CAP_PROP_FRAME_COUNT);
+
+					if (video_len > 0)
+					{
+						int idx_f = rand() % video_len;
+                        
+                        int fcount = 0;
+                        
+                        Mat face;
+                        
+                        while (1)
+                        {
+                            Mat frame;
+                            // Capture frame-by-frame
+                            cap >> frame;
+                            
+                            // If the frame is empty, break immediately
+                            if (frame.empty())
+                                break;
+                            
+                            if(fcount == idx_f){
+                                face = Mat(frame);
+                                
+                                if(params.scale_factor != 1.f && (face.cols >= MAX_WIDTH || face.rows >= MAX_HEIGTH))
+                                	resize(face, face, Size(face.cols*params.scale_factor, face.rows*params.scale_factor),0,0, CV_INTER_LINEAR);
+
+                                // When everything done, release the video capture object
+                                cap.release();
+                                // Closes all the frames
+                                destroyAllWindows();
+                                
+                                break;
+                            }
+                            
+                            fcount++;
+                        }
+                        
+						if (params.face_detector)
+							face = FaceDetection(face, face_classifier);
+
+						if(params.hsv)
+                            cvtColor(face,face, COLOR_BGR2HSV);
+                        else if(params.ycc)
+                            cvtColor(face,face, COLOR_BGR2YCrCb);
+
+						Mat bgr[3];
+						split(face, bgr);//split source 
+
+						for (int k_i = 0; k_i < channels; k_i++)
+						{
+							vector<float> desc = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+							//ftime(&end);
+
+							//printf("Time %d\n", (end.time - ini.time) * 1000 + (end.millitm - ini.millitm));
+
+							int keypoint_size = desc.size() / params.features_dim;
+							//printf("Keypoint %i\n", keypoint_size);
+							//SELECTING RANDOM VECTORS FROM EACH IMAGE FOR MODEL TRAINING
+							int* index = (int*)malloc(sizeof(int)*keypoint_size);
+							for (int j = 0; j < keypoint_size; j++)
+								index[j] = j;
+							shuffle(index, keypoint_size);
+							for (int j = 0; j < numDescrsPerImage; j++)
+							{
+								for (int k = 0; k < params.features_dim; k++)
+									samples_descriptors[(i + k_i)*numDescrsPerImage*params.features_dim + j * params.features_dim + k] = desc[index[j] * params.features_dim + k];
+							}
+							free(index);
+
+							desc.erase(desc.begin());
+						}
+					}
+					else
+						printf("Not frame detection: %s\n", source_url[i].c_str());
+				}
+
+				//ftime(&ini);
+			}
+			
+			SaveDescrBinary(string(params.outputDir) + descriptors_folder + sample_prefix + ext, samples_descriptors, descriptor_size);			
+			/*string aux = string(params.outputDir) + descriptors_folder + sample_prefix + ".csv";
+			FILE* fl = fopen(aux.c_str(), "wb");
+			for (int j = 0; j < descriptor_size; j++)
+			{
+				if(j != 0 && (j + 1) % params.features_dim == 0)
+					fprintf(fl, "%f\n", samples_descriptors[j]);
+				else
+					fprintf(fl, "%f,", samples_descriptors[j]);
+			}
+			fclose(fl);*/
+		}
+	
+		/*---------------------------------------------------------------------------------------------*/
+	
+		/*----------------------------------learn PCA projection---------------------------------------*/	
+		////////////////////////////////////////////////////////////////////
+		///		DIMENSION REDUCTION OF SELECTED FEATURES                ///
+		///////////////////////////////////////////////////////////////////
+		float* descriptors_means = NULL;
+		float* eigenvalues = NULL;
+		float* eigenvectors = NULL;
+		int dim = params.features_dim;
+		int max_components = dim;
+		if(params.PCA_usage)
+		{	
+			string pca_path(params.outputDir);
+			pca_path += "/pca_model.bin";	
+			if(!is_file_exist(pca_path.c_str()))		
+			{			
+				printf("Training PCA model...\n");												
+				pca::train_model(samples_descriptors, descriptor_size/params.features_dim, params.features_dim, params.pca_dim, false, &descriptors_means, &eigenvectors, &eigenvalues);
+				pca::save_model(pca_path, descriptors_means, eigenvalues, eigenvectors, params.pca_dim, params.features_dim);	
+				dim = params.features_dim;
+				max_components = params.pca_dim;
+			}
+			else
+				pca::load_model(pca_path, &descriptors_means, &eigenvectors, &eigenvalues, &max_components, &dim);		
+		}
+
+		/*---------------------------------------------------------------------------------------------*/	
+		///////////////////////////////////////////////
+		///		TRAINING GMM MODELS                ///
+		//////////////////////////////////////////////		
+		float* means, *sigmas, *weights = NULL;		
+		bool mark = false;
+		string output_path(params.outputDir);
+		if (gmm::load_gmm_results_binary(output_path + "/", "pad", means, sigmas, weights, params.num_cluster, dim) < 0)
+		{
+			printf("Training GMM model...\n");
+			//Projecting DSIFT descriptor with PCA model
+			int dimension = params.features_dim;
+			int total_data = descriptor_size/params.features_dim;
+			if(params.PCA_usage)
+			{				
+				float* reduced_descriptors = pca::project(samples_descriptors, descriptor_size/dim, dim, descriptors_means, eigenvectors, max_components);		
+				free(samples_descriptors);
+				samples_descriptors = reduced_descriptors;
+				descriptor_size = (descriptor_size/dim)*max_components;				
+				dimension = max_components;
+				dim = dimension;
+				total_data = descriptor_size/max_components;
+
+
+				//SaveDescrBinary(string(params.outputDir) + descriptors_folder + "/reduced_samples_descriptors" + ext, samples_descriptors, descriptor_size);
+//				string aux = string(params.outputDir) + descriptors_folder + "/pca_samples_descriptors.csv";
+//				FILE* fl = fopen(aux.c_str(), "wb");
+//				for (int j = 0; j < total_data*params.pca_dim; j++)
+//				{
+//					if(j != 0 && (j + 1) % params.pca_dim == 0)
+//						fprintf(fl, "%f\n", samples_descriptors[j]);
+//					else
+//						fprintf(fl, "%f,", samples_descriptors[j]);
+//				}
+//				fclose(fl);
+			}
+			//Training GMM model
+			VlGMM* gmm_model = gmm::train_gmm_model(samples_descriptors, total_data, dimension, params.num_cluster, max_iter, max_iter);
+			printf("\tSave gmm model...\n");
+			gmm::save_gmm_results_binary(params.outputDir, "pad", gmm_model);
+			float* means_tmp = (float*)vl_gmm_get_means(gmm_model);
+			float* sigmas_tmp = (float*)vl_gmm_get_covariances(gmm_model);
+			float* weights_tmp = (float*)vl_gmm_get_priors(gmm_model);
+			means = (float*)malloc(sizeof(float)*params.num_cluster*dimension);
+			sigmas = (float*)malloc(sizeof(float)*params.num_cluster*dimension);
+			weights = (float*)malloc(sizeof(float)*params.num_cluster);
+			memcpy(means, means_tmp, sizeof(float)*params.num_cluster*dimension);
+			memcpy(sigmas, sigmas_tmp, sizeof(float)*params.num_cluster*dimension);
+			memcpy(weights, weights_tmp, sizeof(float)*params.num_cluster);
+			vl_gmm_delete(gmm_model);
+			gmm_model = NULL;
+		}
+		free(samples_descriptors);
+		descriptor_size = 0;
+		////////////////////////////////////////////////////////////////////
+		///		FISHER ENCODING FOR EACH DATABASE IMAGE                 ///
+		///////////////////////////////////////////////////////////////////
+		printf("Loading features for fv encoding...\n");
+#ifdef WIN32
+		mkdir((string(params.outputDir) + fv_folder + to_string(params.num_cluster)).c_str());
+#else
+		mkdir((string(params.outputDir) + fv_folder + to_string(params.num_cluster)).c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+#endif
+		
+		string path_aux = string(params.outputDir) + "/db.info";		
+		//loadDBInfo(path_aux, &db_size);
+		db_size = source_url.size();
+		//Proccesing chunks for image encoding		
+		string tmp_fv = string(params.outputDir) + fv_folder + to_string(params.num_cluster) + fv_descriptors_prefix + ext;
+		string t_path = tmp_fv;
+		int idx_t = tmp_fv.find_last_of('.');						
+		t_path.insert(idx_t, "_info");
+		if(!is_file_exist(t_path.c_str()) && !is_file_exist(tmp_fv.c_str()))
+		{	
+			BLONG fv_dim = 2 * dim* params.num_cluster;
+			float* fv_descriptors = (float*)malloc(sizeof(float)*db_size*fv_dim);
+			//vector<float> fv_descriptors(db_size*fv_dim);
+
+#pragma omp parallel for
+			for (int i = 0; i < db_size; i++)
+			{					
+				printf("FV encoding image %d\n", i);
+				//Load offset for each image inside chunk
+				vector<float> desc;
+
+				if (params.source_type == Image)
+				{
+					Mat img_i = readImage(source_url[i], params.gray);
+					if (img_i.empty()) {
+						cout << "ERROR" << endl;
+						continue;
+					}
+
+					Mat face = img_i;
+					if (params.face_detector)
+						face = FaceDetection(img_i, face_classifier, params.gray);
+
+					if (params.hsv)
+						cvtColor(face, face, COLOR_BGR2HSV);
+					else if (params.ycc)
+						cvtColor(face, face, COLOR_BGR2YCrCb);
+
+					Mat bgr[3];
+
+					if (!params.gray)
+						split(face, bgr);//split source 
+					else
+						bgr[0] = face; 
+
+					for (int k_i = 0; k_i < channels; k_i++)
+					{
+						vector<float> desc_tmp = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+						desc.insert(desc.end(), desc_tmp.begin(), desc_tmp.end());
+					}
+				}
+				else
+				{
+					VideoCapture cap(source_url[i]);
+
+                    if (!cap.isOpened()) {
+                        cout << "Error opening video stream or file" << endl;
+                    }
+                    
+                    int video_len = cap.get(CV_CAP_PROP_FRAME_COUNT);
+
+                    if (video_len > 0)
+                    {
+                        int idx_f = rand() % video_len;
+                        
+                        int fcount = 0;
+                        
+                        Mat face;
+                        
+                        while (1)
+                        {
+                            Mat frame;
+                            // Capture frame-by-frame
+                            cap >> frame;
+                            
+                            // If the frame is empty, break immediately
+                            if (frame.empty())
+                                break;
+                            
+                            if(fcount == idx_f){
+                                face = Mat(frame);
+                                
+                                if(params.scale_factor != 1.f && (face.cols >= MAX_WIDTH || face.rows >= MAX_HEIGTH))
+									resize(face, face, Size(face.cols*params.scale_factor, face.rows*params.scale_factor),0,0, CV_INTER_LINEAR);
+
+                                // When everything done, release the video capture object
+                                cap.release();
+                                // Closes all the frames
+                                destroyAllWindows();
+                                
+                                break;
+                            }
+                            
+                            fcount++;
+                        }
+
+						if(params.face_detector)
+							face = FaceDetection(face, face_classifier);
+
+						if(params.hsv)
+                            cvtColor(face,face, COLOR_BGR2HSV);
+                        else if(params.ycc)
+                            cvtColor(face,face, COLOR_BGR2YCrCb);
+
+						Mat bgr[3];   //destination array
+						split(face, bgr);//split source `
+
+						for (int k_i = 0; k_i < channels; k_i++)
+						{
+							vector<float> desc_tmp = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+							desc.insert(desc.end(), desc_tmp.begin(), desc_tmp.end());
+						}
+					}
+					else
+						printf("No frame detected\n");
+				}
+
+				float* feat_proj = &desc[0];
+				long tmp_size = desc.size();
+				if(params.PCA_usage)
+				{
+					//feature dimension reduction 								
+					feat_proj = pca::project(&desc[0], desc.size()/params.features_dim, params.features_dim, descriptors_means, eigenvectors, max_components);
+					tmp_size = (desc.size()/params.features_dim)*max_components;				
+				}
+
+				float* enc = fisher::fisher_encoding(means, sigmas, weights, feat_proj, tmp_size/max_components, max_components, params.num_cluster);
+				
+				for (int j = 0; j < fv_dim; j++)
+					fv_descriptors[i*fv_dim + j] = enc[j];
+				
+				vl_free(enc);
+				if (params.PCA_usage)
+					free(feat_proj);
+				desc.clear();
+			}			
+			SaveDescrBinary(tmp_fv, fv_descriptors, db_size*fv_dim);
+			free(fv_descriptors);			
+		}		
+		if(params.PCA_usage)
+		{
+			free(descriptors_means);
+			free(eigenvalues);
+			free(eigenvectors);
+		}
+		free(sigmas);
+		free(means);
+		free(weights);
+		free(filter_data);
+		/////////////////////////////////////////////////
+		///		         TRAINING SVM		          ///
+		////////////////////////////////////////////////
+
+		string model_path(string(params.outputDir) + '/' + svm_model_name + ext);	
+		if(!is_file_exist(model_path.c_str()))
+		{
+			printf("Training svm model...\n");		
+			string tmp_fv = string(params.outputDir) + fv_folder + to_string(params.num_cluster) + fv_descriptors_prefix + ext;
+			string t_path = tmp_fv;
+			int idx_t = tmp_fv.find_last_of('.');						
+			t_path.insert(idx_t, "_info");
+			descriptor_size = 0;
+			dim = 2*params.num_cluster*dim;
+			if(LoadDescrBinaryInfo(t_path, &descriptor_size) < 0)
+			{
+				cout << "ERROR LOADING FV DESCRIPTORS";
+				return;
+			}		
+			db_size = source_url.size();
+			float* fv_descriptors = (float*)malloc(descriptor_size*sizeof(float));			
+			LoadDescrBinary(tmp_fv, fv_descriptors, descriptor_size);		
+		
+			int* index = (int*)malloc(sizeof(int)*db_size);
+			for (int i = 0; i < db_size; i++)
+				index[i] = i;
+			float* model[nr_classes];
+			float bias[nr_classes];
+			int model_dim = 0;		
+
+			for (int i = 0; i < nr_classes; i++)
+			{
+				const char* class_name = i == 0? "fake": "live";
+				printf("Training svm for %s class\n", class_name);			
+				shuffle(index, db_size);
+				double* labels = GetLabels(source_url, class_name);
+				double* random_labels = (double*)malloc(sizeof(double)*db_size);
+				float* random_fv = (float*)malloc(descriptor_size*sizeof(float));
+				for (int j = 0; j < db_size; j++)
+				{
+					memcpy(&(random_fv[j*dim]), &(fv_descriptors[index[j] * dim]), sizeof(float)*dim);
+					random_labels[j] = labels[index[j]];
+				}								
+
+				//Setting svm paramters
+				VlSvmDataset* dataset = vl_svmdataset_new(VL_TYPE_FLOAT, random_fv, dim, db_size);
+				double lambda = (double)1/(svm_C*db_size);
+				
+				VlSvm* svm = vl_svm_new_with_dataset(VlSvmSolverSdca, dataset, random_labels, lambda);
+				vl_svm_set_bias_multiplier(svm, 1);
+				vl_svm_set_loss(svm, VlSvmLossHinge);
+				vl_svm_set_epsilon(svm, epsilon);
+				vl_svm_set_max_num_iterations(svm, max_iter*db_size);
+
+				vl_svm_train(svm);
+
+				const double* m = vl_svm_get_model(svm);
+				bias[i] = vl_svm_get_bias(svm);
+				model_dim = vl_svm_get_dimension(svm);
+				const VlSvmStatistics* statistics = vl_svm_get_statistics(svm);
+				printf("loss = %f and dual_loss = %f\n", statistics->loss, statistics->dualLoss);
+				switch (statistics->status)
+				{
+				case VlSvmStatusConverged:
+						printf("Solver converged...\n");
+						break;
+				case VlSvmStatusMaxNumIterationsReached:
+					printf("Iteration number reached...\n");
+					break;			
+				}
+
+				model[i] = (float*)malloc(sizeof(float)*model_dim);
+
+				for (int j = 0; j < model_dim; j++)
+					model[i][j] = m[j];
+				
+				vl_svmdataset_delete(dataset);
+				vl_svm_delete(svm);
+				free(random_fv);
+				free(random_labels);
+				free(labels);
+			}
+			free(fv_descriptors);
+			free(index);
+			save_model(model_path, model, bias, model_dim, nr_classes);
+			for(int i = 0; i < nr_classes; i++)
+				free(model[i]);
+		}
+	}	
+	
+	void testing_fv_encoder(extract_params<float> params)
+	{
+		vector<string> source_url;
+
+		int channels = 1;
+		char idx[3] = { 0,1,2 };
+
+		if (!params.gray)
+		{
+			switch (params.channels_params)
+			{
+			case all:
+				channels = 3;
+				break;
+			case green:
+				idx[0] = 1;
+				break;
+			case blue:
+				idx[0] = 2;
+				break;
+			case red:
+				break;
+			}
+		}
+
+		if(params.folder_path)
+		{
+			if (params.source_type == Image)
+			{
+				vector<string> img_bmp, img_png, img_jpg;
+				get_files(params.sourceDir, ".tiff", source_url);
+				get_files(params.sourceDir, ".bmp", img_bmp);
+				get_files(params.sourceDir, ".jpg", img_jpg);
+				get_files(params.sourceDir, ".png", img_png);
+
+				source_url.insert(source_url.end(), img_bmp.begin(), img_bmp.end());
+				source_url.insert(source_url.end(), img_jpg.begin(), img_jpg.end());
+				source_url.insert(source_url.end(), img_png.begin(), img_png.end());
+			}
+			else
+			{
+				vector<string> img_mp4;
+				vector<string> img_mov;
+				get_files(params.sourceDir, ".avi", source_url);
+				get_files(params.sourceDir, ".mp4", img_mp4);
+				get_files(params.sourceDir, ".mov", img_mov);
+				source_url.insert(source_url.end(), img_mp4.begin(), img_mp4.end());
+				source_url.insert(source_url.end(), img_mov.begin(), img_mov.end());
+			}
+		}
+		else
+			LoadTextFile(params.sourceDir, source_url);
+
+		int db_size = source_url.size();
+
+		float* means = NULL, *sigmas = NULL, *weights = NULL;					
+		string output_path(params.outputDir);
+		if (gmm::load_gmm_results_binary(output_path + "/", "pad", means, sigmas, weights, params.num_cluster, params.pca_dim) < 0)
+		{
+			cout << "GMM MODEL NOT FOUND\n";
+			return;
+		}
+	
+		float* descriptors_means = NULL;
+		float* eigenvalues = NULL;
+		float* eigenvectors = NULL;
+		int pca_dim = params.features_dim;
+		int dimension = 0;
+		if(params.PCA_usage)
+		{
+			string pca_path(params.outputDir);
+			pca_path += "/pca_model.bin";
+			if(!is_file_exist(pca_path.c_str()))
+			{
+				cout << "PCA MODEL NOT FOUND\n";
+				return;
+			}
+			else
+			{
+				printf("Loading PCA model...\n");
+				pca::load_model(pca_path, &descriptors_means, &eigenvectors, &eigenvalues, &pca_dim, &dimension);
+			}
+		}
+
+		string model_path(string(params.outputDir) + '/' + svm_model_name + ext);	
+		string t_path_model = model_path;
+		int idx_model = model_path.find_last_of('.');						
+		t_path_model.insert(idx_model, "_info");
+		int dim = 0;
+		float* model[nr_classes];
+		float bias[nr_classes];
+		printf("Loading SVM model...\n");
+		if(!is_file_exist(model_path.c_str()) && !is_file_exist(t_path_model.c_str()))
+		{
+			cout << "MODEL NOT FOUND\n";
+			return;
+		}
+		if (load_model(model_path, model, bias, &dim, nr_classes) < 0)
+		{
+			cout << "CORRUPT MODEL DATA\n";
+		}
+
+		/*int fake_count = 0, live_count = 0;
+		double* labels = GetLabels(source_url, "live", &fake_count, &live_count);
+		double fsar = 0;
+		double flrr = 0;*/
+		float* results = (float*)malloc(sizeof(float)*db_size);
+		//int* results_ace = (int*)malloc(sizeof(int)*db_size);
+		printf("Processing source %d\n", db_size);
+		//omp_set_num_threads(2);
+			//timeb ini, end;	
+		//ftime(&ini);
+		/*output_path += "/";
+		output_path += params.database_name;
+		output_path += ".txt";
+		FILE* fp = fopen(output_path.c_str(), "wb");
+
+
+		for (int i = 0; i < db_size; i++)
+			fprintf(fp, "%s\n", source_url[i].c_str());
+		fclose(fp);*/
+		CascadeClassifier face_classifier = LoadFaceClassifier(classifier_path);
+
+		int filter_dim[3];
+		float* filter_data = NULL;
+		//Reading filters
+		//printf("Reading filter\n");
+		read_filter(filter_dim, &filter_data, params.filter_path);
+
+	#pragma omp parallel for // num_threads(24)
+		for (int i = 0; i < db_size; i++)
+		{
+			printf("Proccesing image %i from %i\n", i + 1, static_cast<int>(source_url.size()));
+
+			vector<float> desc;
+
+			if (params.source_type == Image)
+			{
+				Mat img_i = readImage(source_url[i], params.gray);
+				if (img_i.empty()) {
+					cout << "ERROR" << endl;
+					continue;
+				}
+
+				Mat face = img_i;
+				if (params.face_detector)
+					face = FaceDetection(img_i, face_classifier, params.gray);
+
+				if (params.hsv)
+					cvtColor(face, face, COLOR_BGR2HSV);
+				else if (params.ycc)
+					cvtColor(face, face, COLOR_BGR2YCrCb);
+
+				Mat bgr[3];
+
+				if (!params.gray)
+					split(face, bgr);//split source 
+				else
+					bgr[0] = face;
+
+				for (int k_i = 0; k_i < channels; k_i++)
+				{
+					vector<float> desc_tmp = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+					desc.insert(desc.end(), desc_tmp.begin(), desc_tmp.end());
+				}
+			}
+			else
+			{
+				VideoCapture cap(source_url[i]);
+
+                if (!cap.isOpened()) {
+                    cout << "Error opening video stream or file" << endl;
+                }
+                
+                int video_len = cap.get(CV_CAP_PROP_FRAME_COUNT);
+
+                if (video_len > 0)
+                {
+                    int idx_f = rand() % video_len;
+                    
+                    int fcount = 0;
+                    
+                    Mat face;
+                    
+                    while (1)
+                    {
+                        Mat frame;
+                        // Capture frame-by-frame
+                        cap >> frame;
+                        
+                        // If the frame is empty, break immediately
+                        if (frame.empty())
+                            break;
+                        
+                        if(fcount == idx_f){
+                            face = Mat(frame);
+                            
+                            if(params.scale_factor != 1.f && (face.cols >= MAX_WIDTH || face.rows >= MAX_HEIGTH))
+								resize(face, face, Size(face.cols*params.scale_factor, face.rows*params.scale_factor),0,0, CV_INTER_LINEAR);
+
+                            // When everything done, release the video capture object
+                            cap.release();
+                            // Closes all the frames
+                            destroyAllWindows();
+                            
+                            break;
+                        }
+                        
+                        fcount++;
+                    }
+
+					if (params.face_detector)
+						face = FaceDetection(face, face_classifier);
+
+					if(params.hsv)
+                        cvtColor(face,face, COLOR_BGR2HSV);
+                    else if(params.ycc)
+                        cvtColor(face,face, COLOR_BGR2YCrCb);
+
+					Mat bgr[3];   //destination array
+					split(face, bgr);//split source 
+
+					for (int k_i = 0; k_i < channels; k_i++)
+					{
+						vector<float> desc_tmp = compute_bsif_for_image(bgr[idx[k_i]], filter_dim, filter_data);
+						desc.insert(desc.end(), desc_tmp.begin(), desc_tmp.end());
+					}
+				}
+			}
+
+			float* reduced_descriptors = &desc[0];
+			int dim_reduced_desc = desc.size();
+			if(params.PCA_usage)
+			{
+				reduced_descriptors = pca::project(&desc[0], desc.size()/ params.features_dim, params.features_dim, descriptors_means, eigenvectors, pca_dim);
+				int dim_reduced_desc = (desc.size()/ params.features_dim)*pca_dim;		
+			}
+			float* enc = fisher::fisher_encoding(means, sigmas, weights, reduced_descriptors, desc.size()/params.features_dim, pca_dim, params.num_cluster);
+			if(params.PCA_usage)
+				free(reduced_descriptors);
+			double probability[nr_classes];
+			int model_size = dim;
+			for (int j = 0; j < nr_classes; j++)
+			{
+				probability[j] = 0;
+				for (int k = 0; k < model_size; k++)
+					probability[j] += (enc[k] * model[j][k]);
+				probability[j] += bias[j];
+			}		
+			vl_free(enc);
+			//int label = (probability[0] >= params.threshold) ? -1: 1;
+			//int label = (probability[0] > 0) ? 1 : -1;
+			printf("Probability vector (%f, %f)\n", probability[0], probability[1]);
+			results[i] = probability[1];		
+			//printf("Label prediction - real label (%i, %i)\n", (int)label, real_label);
+		}
+		//ftime(&end);
+		//int end_time = (end.time - ini.time) * 1000 + (end.millitm - ini.millitm);
+		//printf("%d\n", end_time);		
+		//printf("%d\n", end_time/db_size);		
+		for (int i = 0; i < nr_classes; i++)
+			free(model[i]);
+
+		/*for (int i = 0; i < db_size; i++)
+		{
+			int diff = results_ace[i] + (int)labels[i];
+			printf("Label prediction %i - real label %i\n", results_ace[i], (int)labels[i]);
+			if(diff == 0)
+			{
+				if (labels[i] == 1)
+					flrr++;
+				else
+					fsar++;
+			}
+		}*/
+
+		free(filter_data);
+
+		/*string output_ace(params.outputDir);
+		output_ace += "/";
+		output_ace += params.database_name;
+		output_ace += "_ace.txt";
+		FILE* fl = fopen(output_ace.c_str(), "wb");
+		fprintf(fl, "Missclassified fake fingerprint = %f\n", fsar);
+		fprintf(fl, "Missclassified live fingerprint = %f\n", flrr);
+		flrr /= (double)live_count;
+		fsar /= (double)fake_count;
+		double ace = (double)(flrr + fsar)/2;
+		fprintf(fl, "FSAR value = %f\n", fsar);
+		fprintf(fl, "FLRR value = %f\n", flrr);
+		fprintf(fl, "ACE value = %f\n", 100*ace);
+		fclose(fl);*/
+
+		output_path += "/";
+		output_path += params.database_name;
+		output_path += ".txt";
+		FILE* fl = fopen(output_path.c_str(), "wb");
+
+		/*fprintf(fl, "Missclassified fake fingerprint = %f\n", fsar);
+		fprintf(fl, "Missclassified live fingerprint = %f\n", flrr);*/
+
+		/*fprintf(fl, "FSAR value = %f\n", fsar);
+		fprintf(fl, "FLRR value = %f\n", flrr);
+		fprintf(fl, "ACE value = %f\n", 100*ace);*/
+		for (int i = 0; i < db_size; i++)
+			fprintf(fl, "%f\n", results[i]);
+		fclose(fl);
+		//free(labels);
+		free(results);
+		//free(results_ace);
+		free(means);
+		free(sigmas);
+		free(weights);	
+		if(params.PCA_usage)
+		{
+			free(eigenvalues);
+			free(eigenvectors);
+			free(descriptors_means);
+		}
+	}
+
+}
+

@@ -1,0 +1,231 @@
+﻿// pda_demo.cpp : Defines the entry point for the console application.
+//
+//
+//
+//  Fisher vector, vlad and bovw representation
+//
+//  Created by L�zaro Janier Glez-Soler on 06/01/18.
+//  Copyright � 2018 w. All rights reserved.
+//
+
+#include <cstdio>
+#include <opencv2/opencv.hpp>
+#include "pdafv_pipeline.h"
+#include <dirent.h>
+#include <getopt.h>
+
+
+using namespace std;
+
+#define BUFFER_SIZE 1000
+
+
+static void help()
+{
+	cout << "\nSDK for presentation attack detection. \n" << endl;
+	cout << "Created by PhD. student Lazaro Janier Gonzalez Soler. \n" << endl;
+
+	cout << "USAGE: \n"
+		"\tParameters: \n"
+		"\t[Cl]: Clustering algorithm selector (Cl=0: Using BMM, Cl=1: Using GMM)\n"
+		"\t[-m val]: algorithm mode (val=1: training, val=2: testing)\n"
+		"\t[-k val]: input format (val=0: image, val=1: video)\n"
+		"\t[-i input_path]: path to input images\n"
+		"\t[-o output_path]: path to output folder\n"
+		"\t[-c num_centers]: number of center used by algorithms (default: 256)\n"
+		"\t[-d features_dim]: features dim (default: 128)\n"
+		"\t[-z num_features]: number of features used by pca, gmm or bovw training (default: 1000000)\n"
+		"\t[-f filter_path]: path to txt file, which contains physical filter path\n"
+		"\t[-s scale_factor]: scale factor to resize an input image (default: 1.0)\n"
+		"\t[-n output_filename]: output name used for saving test results\n"
+		"\t[-g val]: input format (val=0: rgb image, val=1: gray image)\n"
+		"\t[-r val]: use face detector (val = 0: false, val = 1: true, default: 1)\n"
+		"\t[-t val]: select channel to use (val = 0: red channel, val = 1: green channel, val = 2: blue channel, val = 3: all channels, default: 3)\n"
+		"\t[-h val]: convert images to hsv color space (val = 0: false, val = 1: true, default: 0)\n"
+		"\t[-y val]: convert images to ycc color space (val = 0: false, val = 1: true, default: 0)\n"
+		"\t[-l val]: select the points to extract the features (val = 0: false, val = 1: true, default: 0)\n"
+		"EXAMPLE\n"
+		"training: \t./FVdemo -m 1 -k 1 -i ~/images_folder -o ~/output_folder -c 512 -z 1000000 -y 1 -r 0 -t 1\n"
+		"testing: \t./FVdemo -m 2 -k 1 -i ~/images_folder -o ~/output_folder -c 512  -y 1 -r 0 -t 1 -n database_name\n" << endl;
+
+}
+
+int LoadOptions(int argc, char **argv, extract_params<float>* params)
+{
+	int c;
+	params->sourceDir = (char *)malloc(sizeof(char) * 256);
+	params->outputDir = (char *)malloc(sizeof(char) * 256);
+	params->filter_path = (char *)malloc(sizeof(char) * 256);
+	params->points = false;
+	int it = 0;
+	params->folder_path = true;
+	params->mode = 1;
+	params->pca_dim = 64;
+	params->channels_params = all;
+	params->hsv = false;
+	params->ycc = false;
+	params->gray = false;
+	params->source_type = Image;
+	params->face_detector = true;
+	params->PCA_usage = true;
+	params->features_dim = 128;
+	params->num_cluster = 256;
+	params->descriptors_count = 1000000;
+	params->scale_factor = 1;
+
+	while ((c = getopt(argc, argv, "m:n:i:o:k:c:z:p:d:f:r:x:t:h:s:y:g:l:")) != -1)
+	{
+		it++;
+		switch (c)
+		{
+		case 'm':
+			params->mode = atoi(optarg);
+			break;
+		case 'i':
+			strcpy(params->sourceDir, optarg);
+			break;
+		case 'o':
+			strcpy(params->outputDir, optarg);
+			break;
+		case 'f':
+			strcpy(params->filter_path, optarg);
+			break;
+		case 'l':
+			params->points = static_cast<bool>(atoi(optarg));
+			break;
+		case 'c':
+			params->num_cluster = atoi(optarg);
+			break;
+		case 'd':
+			params->features_dim= atoi(optarg);
+			break;
+		case 't':
+			params->channels_params = static_cast<Channels>(atoi(optarg));
+			break;
+		case 'h':
+			params->hsv = static_cast<bool>(atoi(optarg));
+			break;
+		case 'g':
+			params->gray = static_cast<bool>(atoi(optarg));
+			break;
+		case 'x':
+			params->folder_path = static_cast<bool>(atoi(optarg));
+			break;
+		case 'y':
+			params->ycc = static_cast<bool>(atoi(optarg));
+			break;
+		case 's':
+			params->scale_factor = static_cast<float>(atof(optarg));
+			break;
+		case 'r':
+			params->face_detector = static_cast<bool>(atoi(optarg));
+			break;
+		case 'k':
+			params->source_type = SourceType(atoi(optarg));
+			break;
+		case 'z':
+			params->descriptors_count = atoi(optarg);
+			break;
+		case 'p':
+			params->pca_dim = atoi(optarg);
+			break;
+		case 'n':
+			params->database_name = optarg;
+			break;
+		case ':':
+			printf("\n*** La opci�n -%c requiere de un par�metro\n", optopt);
+			return 0;
+		case '?':
+			printf("\n*** Opci�n no reconocida: -%c\n", optopt);
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+template<class T>
+void free_extract_params(extract_params<T>* params)
+{
+	free(params->sourceDir);
+	free(params->outputDir);
+	free(params->filter_path);
+}
+
+void printParams(extract_params<float> params)
+{
+	printf("=========================Paramters configuration==========================\n");
+
+	printf("mode: %i\n", params.mode);
+
+	printf("input_folder: %s\n", params.sourceDir);
+
+	printf("output_folder: %s\n", params.outputDir);
+
+	printf("filter_path: %s\n", params.filter_path);
+
+	printf("Available points: %i\n", params.points);
+
+	printf("num_descriptors: %i\n", params.descriptors_count);
+
+	printf("source_type: %i\n", params.source_type);
+
+	printf("folder_path: %i\n", params.folder_path);
+
+	printf("using pca: %i\n", params.PCA_usage);
+
+	printf("channels_conf: %i\n", params.channels_params);
+
+	printf("using face detector: %i\n", params.face_detector);
+
+	printf("using hsv config: %i\n", params.hsv);
+
+	printf("using gray config: %i\n", params.gray);
+
+	printf("using ycc config: %i\n", params.ycc);
+
+	printf("num_clusters: %i\n", params.num_cluster);
+
+	printf("pca_dim: %i\n", params.pca_dim);
+
+	printf("scale_factor: %f\n", params.scale_factor);
+}
+
+int main(int argc, char * argv[])
+{
+	if (argc < 4)
+	{
+		help();
+		return -1;
+	}
+	extract_params<float> params;
+	LoadOptions(argc, argv, &params);
+
+	printParams(params);
+
+	switch (params.mode) {
+	case 1:
+		///////////////////////////////////////////////////////
+		// TRAIN ENCODER
+		///////////////////////////////////////////////////////
+	{
+		pdafv::training_fv_encoder(params);
+	}
+	break;
+	case 2:
+		///////////////////////////////////////////////////////
+		// TEST SAMPLES USING TRAINED DECODER
+		///////////////////////////////////////////////////////
+	{
+		pdafv::testing_fv_encoder(params);
+	}
+	break;
+	default:
+		break;
+	}
+	free_extract_params(&params);
+
+	return 0;
+}
+
+

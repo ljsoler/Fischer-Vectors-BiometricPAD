@@ -1,0 +1,5 @@
+4
+/home/janier.soler/eclipse-workspace/output_filters/ICAtextureFilters_3x3_7bit.filter
+/home/janier.soler/eclipse-workspace/output_filters/ICAtextureFilters_5x5_7bit.filter
+/home/janier.soler/eclipse-workspace/output_filters/ICAtextureFilters_7x7_7bit.filter
+/home/janier.soler/eclipse-workspace/output_filters/ICAtextureFilters_9x9_7bit.filter

@@ -1,0 +1,91 @@
+/** @internal
+ ** @file     phog.c
+ ** @author   Lazaro Janier Glez Soler
+ ** @brief    PHOG (HOG) from VLFEAT
+ **/
+
+#include <stdio.h>
+#include <math.h>
+#include <assert.h>
+#include <stdio.h>
+#include <math.h>
+#include <opencv2/opencv.hpp>
+#include "pbsif.h"
+#include "histogram.hpp"
+
+#define filter_config_path "filter_config.txt"
+#define cSize 4
+#define xy_step 3
+static int binSz[cSize] = {4, 8, 16, 32};
+
+using namespace std;
+using namespace cv;
+
+int read_filter(int filter_dims[], float** filter_data, const char* filter_path) {
+
+	FILE* file = fopen(filter_path, "rb+");
+	char* fpath = (char*)malloc(sizeof(char*)*256);
+	fscanf(file, "%s\n", fpath);
+	fclose(file);
+    //read filter-----------------------------	
+	string path = string(fpath);
+	std::ifstream infile;
+	infile.open(path.c_str(), std::ios::in | std::ios::binary);
+	int dim = 0, f_size = 0;
+	infile.read((char*)&dim, sizeof(int));
+	infile.read((char*)&f_size, sizeof(int));
+	float* copied_data = (float*)malloc(sizeof(float)*dim*dim*f_size);
+	infile.read((char*)copied_data, dim*dim*f_size*sizeof(float));
+	infile.close();
+	printf("%f\n", copied_data[0]);
+    //-copy dims-------------------------------
+    filter_dims[0] = dim;
+    filter_dims[1] = dim;
+	filter_dims[2] = f_size;
+
+    //-copy filter-data------------------------    
+    *filter_data = copied_data;    
+	free(fpath);
+    return EXIT_SUCCESS;
+}
+
+vector<float> compute_bsif_for_image(const Mat image)
+{	
+	int im_width = image.cols;
+	int im_height = image.rows;
+	vector<float> descrs_bsif;	
+	
+	int filter_dim[3];
+	float* filter_data = NULL;
+	//Reading filters
+	read_filter(filter_dim, &filter_data, filter_config_path);
+	
+	int num_filter = filter_dim[2]; //Number of filters
+	int r = floor(filter_dim[0]/2);
+	unsigned short* code = (unsigned short*)malloc(sizeof(unsigned short)*im_height*im_width);
+	
+	for (int i = 0; i < im_height*im_width; i++) code[i] = 1;
+	//Building bsif code
+	for (int i = 0; i < filter_dim[2]; i++)
+	{
+		Mat out;		
+		Mat kernel(filter_dim[0], filter_dim[1], CV_32F, &filter_data[(filter_dim[2] - i - 1)*filter_dim[0]*filter_dim[1]]);
+		float b = kernel.at<float>(2,2);
+		filter2D(image, out, -1, kernel, cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+		for (int j = 0; j < im_height; j++)
+			for (int k = 0; k < im_width; k++)
+				code[j*im_width + k] += (out.data[j*im_width + k] > 0)? pow(2, i): 0;
+	}	
+	if(filter_data != NULL) free(filter_data);
+	//Building histogram
+	Mat bsif = Mat(im_height, im_width, CV_16U, code);
+	for(int i = 0; i < cSize; i++)
+	{
+		Mat sp;
+		lbplibrary::spatial_histogram(bsif, sp, pow(2, filter_dim[2]), binSz[i], binSz[i], xy_step);
+		descrs_lbp.assign(sp.begin<int>(), sp.end<int>());
+	}
+
+	return descrs_bsif;
+}
+

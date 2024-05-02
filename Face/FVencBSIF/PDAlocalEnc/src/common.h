@@ -1,0 +1,125 @@
+#ifndef COMMON_H
+#define COMMON_H
+
+#include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+
+#define name_size 50
+
+#define ROUND(d) floor(d + 0.5)
+
+#ifdef WIN32
+typedef	long long BLONG;
+#else
+typedef long BLONG;
+#endif // WIN32
+
+struct Geometry
+{
+	int numBinX;
+	int numBinY;
+	int binSizeX;
+	int binSizeY;
+};
+
+enum SourceType
+{
+	Image,
+	Video
+};
+
+enum Channels
+{
+	red = 0,
+	green = 1,
+	blue = 2,
+	all = 3
+};
+
+template<class T>
+struct extract_params
+{	
+	int mode;
+	SourceType source_type;
+	Channels channels_params;
+	std::vector<T> (*feature_extractor)(const cv::Mat);
+	char* sourceDir;
+	char* outputDir;
+	char* filter_path;
+	bool points;
+	int num_cluster;
+	float scale_factor;
+	int features_dim;
+	bool face_detector;
+	bool hsv;
+	bool ycc;
+	bool gray;
+	int pca_dim;		
+	int descriptors_count;	
+	std::string database_name;
+	bool PCA_usage;
+	double threshold;
+	bool folder_path;
+};
+
+std::vector<std::tuple<int, int>> load_points(const char* point_path);
+
+cv::CascadeClassifier LoadFaceClassifier(char* model_path);
+
+cv::Mat FaceDetection(cv::Mat image, cv::CascadeClassifier face_cascade, bool gray = false);
+
+void Convert2Binary(std::vector<uchar> &x, int bits);
+
+std::vector<float> Convert2BinaryFloat(std::vector<uchar> x, int bits);
+
+cv::Mat image_segmentation(cv::Mat src);
+
+int SaveDescrBinary(std::string path, const unsigned char* descr, BLONG descr_size);
+
+int SaveDescrBinary(std::string path, const float* descr, BLONG descr_size);
+
+int SaveDescrBinary(std::string path, float* descr, BLONG descr_size);
+
+int LoadDescrBinary(std::string path, unsigned char* descr, BLONG size);
+
+int LoadDescrBinary(std::string path, float* descr, BLONG size);
+
+int LoadDescrBinaryInfo(std::string path, BLONG *size);
+
+int LoadTextFile(std::string path, std::vector<std::string> &output);
+
+int SaveDescrAsText(std::string path, std::vector<float> descr, int dim_desc);
+
+int SaveDescrAsText(std::string path, std::vector<float> descr);
+
+int loadDBInfo(std::string path, int* num_images);
+
+int SaveDBInfo(std::string path, int num_images);
+
+int SaveDescrChunkBinary(std::string path, float* descr, long descr_size);
+
+double* GetLabels(std::vector<std::string> image_url, const char* positive_class);
+
+double* GetLabels(std::vector<std::string> image_url, const char* positive_class, int* fake_count, int* live_count);
+
+void copyFile(const std::string& fileNameFrom, const std::string& fileNameTo);
+
+cv::Mat readImage(std::string image_path, bool gray);
+
+int load_model(std::string path, float* model[], float bias[], int* model_size, int nr_classes);
+
+int save_model(std::string path, float* model[], float* bias, int model_size, int nr_classes);
+
+int get_files(const std::string folder_path, const std::string extension, std::vector<std::string> &files, int max_number = INT_MAX, const bool deeper_search = true);
+
+bool is_file_exist(const char *fileName);
+
+std::string to_string_(int value);
+
+double Min(int ndim, const double* const a);
+
+int ArgMin(int ndim, const double* const a);
+
+int ArgMax(int ndim, const double* const a);
+
+#endif
